@@ -434,6 +434,51 @@ class TestProducerConsumerPattern:
         assert len(result) == 5
         assert result == ["id1", "id2", "id3", "id4", "id5"]
 
+    @pytest.mark.asyncio
+    async def test_parallel_execution_processes_batches_concurrently_in_order(self):
+        """Multiple consumers should process batches concurrently and return IDs in batch order."""
+        import asyncio
+
+        from app.routes.document_routes import _process_documents_async_pipeline
+
+        active_batches = 0
+        max_active_batches = 0
+        active_lock = asyncio.Lock()
+
+        async def tracking_add_documents(docs, ids=None, executor=None):
+            nonlocal active_batches, max_active_batches
+            async with active_lock:
+                active_batches += 1
+                max_active_batches = max(max_active_batches, active_batches)
+
+            await asyncio.sleep(0.01)
+
+            async with active_lock:
+                active_batches -= 1
+
+            return [f"id_{doc.metadata['idx']}" for doc in docs]
+
+        mock_store = AsyncMock()
+        mock_store.aadd_documents = tracking_add_documents
+        mock_store.delete = AsyncMock()
+
+        docs = [
+            Document(page_content=f"doc_{i}", metadata={"idx": i}) for i in range(6)
+        ]
+
+        with patch("app.routes.document_routes.EMBEDDING_BATCH_SIZE", 1):
+            result = await _process_documents_async_pipeline(
+                documents=docs,
+                file_id="test",
+                vector_store=mock_store,
+                executor=None,
+                parallel_execution=3,
+                user_id="test_user",
+            )
+
+        assert max_active_batches > 1
+        assert result == [f"id_{i}" for i in range(6)]
+
 
 class TestSyncBatchedMongoCompat:
     """Regression tests for MongoDB-compatible batch processing (PR #266)."""
