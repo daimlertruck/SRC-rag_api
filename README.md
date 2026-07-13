@@ -144,6 +144,7 @@ For large files, you can enable batched embedding processing to reduce memory co
 |----------|---------|-------------|
 | `EMBEDDING_BATCH_SIZE` | `0` | Number of document chunks to process per batch. `0` disables batching (original behavior). |
 | `EMBEDDING_MAX_QUEUE_SIZE` | `3` | Maximum number of batches to buffer in memory during async processing. |
+| `PARALLEL_EXECUTION` | `2` | Maximum number of async embedding/database insertion consumers per file when batching is enabled. |
 
 #### Recommended Settings
 
@@ -156,14 +157,17 @@ For memory-constrained environments (< 2GB RAM):
 For high-throughput environments:
 - `EMBEDDING_BATCH_SIZE=1000-2000`
 - `EMBEDDING_MAX_QUEUE_SIZE=5`
+- Increase `PARALLEL_EXECUTION` cautiously; it applies per active file upload.
 
 #### Behavior
 
 When `EMBEDDING_BATCH_SIZE > 0`:
 - Documents are processed in batches of the specified size
-- Each batch is embedded and inserted before the next batch starts
+- Up to `PARALLEL_EXECUTION` batches for the same file can be embedded and inserted concurrently
+- `PARALLEL_EXECUTION` is per request/file. Total process concurrency can be roughly `active uploads * PARALLEL_EXECUTION`, bounded indirectly by `RAG_THREAD_POOL_SIZE` and downstream provider/database limits
 - On failure, successfully inserted documents are rolled back
-- Memory usage is bounded by `EMBEDDING_BATCH_SIZE * EMBEDDING_MAX_QUEUE_SIZE`
+- Memory usage is bounded by queued plus active batches, roughly `EMBEDDING_BATCH_SIZE * (EMBEDDING_MAX_QUEUE_SIZE + PARALLEL_EXECUTION)`
+- Ingestion lifecycle logs include route, user, file, chunk count, file size, elapsed time, and selected process memory context. Per-batch queue/insert progress is logged at debug level
 
 When `EMBEDDING_BATCH_SIZE = 0` (default):
 - All documents are processed at once (original behavior)

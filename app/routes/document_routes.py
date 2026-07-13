@@ -167,6 +167,7 @@ def build_ingestion_context(
     known_type: Optional[str] = None,
     file_ext: Optional[str] = None,
     chunk_count: Optional[int] = None,
+    include_memory: bool = False,
 ) -> str:
     """Build a compact ingestion context string for logs."""
     parts = [
@@ -178,7 +179,6 @@ def build_ingestion_context(
     if content_type:
         parts.append(f"content_type={content_type}")
     if temp_file_path:
-        parts.append(f"temp_path={temp_file_path}")
         file_size_bytes = get_file_size_bytes(temp_file_path)
         if file_size_bytes is not None:
             parts.append(f"file_size_bytes={file_size_bytes}")
@@ -188,7 +188,8 @@ def build_ingestion_context(
         parts.append(f"file_ext={file_ext}")
     if chunk_count is not None:
         parts.append(f"chunk_count={chunk_count}")
-    parts.append(get_process_memory_details())
+    if include_memory:
+        parts.append(get_process_memory_details())
     return " | ".join(parts)
 
 
@@ -577,8 +578,8 @@ async def _process_documents_async_pipeline(
                 batch_documents = documents[start_idx:end_idx]
                 batch_ids = [file_id] * len(batch_documents)
 
-                logger.info(
-                    "Queueing batch | user_id=%s | file_id=%s | batch=%d/%d | chunk_range=%d-%d | batch_chunks=%d | %s",
+                logger.debug(
+                    "Queueing batch | user_id=%s | file_id=%s | batch=%d/%d | chunk_range=%d-%d | batch_chunks=%d",
                     user_id,
                     file_id,
                     batch_idx + 1,
@@ -586,7 +587,6 @@ async def _process_documents_async_pipeline(
                     start_idx,
                     end_idx - 1,
                     len(batch_documents),
-                    get_process_memory_details(),
                 )
 
                 # Put batch in queue for processing
@@ -612,14 +612,13 @@ async def _process_documents_async_pipeline(
 
                 batch_documents, batch_ids, batch_num, total_batches = item
 
-                logger.info(
-                    "Inserting batch | user_id=%s | file_id=%s | batch=%d/%d | batch_chunks=%d | %s",
+                logger.debug(
+                    "Inserting batch | user_id=%s | file_id=%s | batch=%d/%d | batch_chunks=%d",
                     user_id,
                     file_id,
                     batch_num,
                     total_batches,
                     len(batch_documents),
-                    get_process_memory_details(),
                 )
 
                 try:
@@ -888,6 +887,7 @@ async def store_data_in_vector_db(
             content_type=content_type,
             temp_file_path=temp_file_path,
             chunk_count=len(docs),
+            include_memory=True,
         ),
     )
 
@@ -930,6 +930,7 @@ async def store_data_in_vector_db(
                 content_type=content_type,
                 temp_file_path=temp_file_path,
                 chunk_count=len(docs),
+                include_memory=True,
             ),
             len(ids),
             int((time.perf_counter() - start_time) * 1000),
@@ -947,6 +948,7 @@ async def store_data_in_vector_db(
                 content_type=content_type,
                 temp_file_path=temp_file_path,
                 chunk_count=len(docs),
+                include_memory=True,
             ),
             int((time.perf_counter() - start_time) * 1000),
             str(e),
