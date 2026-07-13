@@ -165,7 +165,7 @@ When `EMBEDDING_BATCH_SIZE > 0`:
 - Documents are processed in batches of the specified size
 - Up to `PARALLEL_EXECUTION` batches for the same file can be embedded and inserted concurrently
 - `PARALLEL_EXECUTION` is per request/file. Total process concurrency can be roughly `active uploads * PARALLEL_EXECUTION`, bounded indirectly by `RAG_THREAD_POOL_SIZE` and downstream provider/database limits
-- On failure, successfully inserted documents are rolled back
+- On failure, remaining batch work is stopped and successfully inserted documents are rolled back
 - Memory usage is bounded by queued plus active batches, roughly `EMBEDDING_BATCH_SIZE * (EMBEDDING_MAX_QUEUE_SIZE + PARALLEL_EXECUTION)`
 - Ingestion lifecycle logs include route, user, file, chunk count, file size, elapsed time, and selected process memory context. Per-batch queue/insert progress is logged at debug level
 

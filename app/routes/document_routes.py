@@ -555,6 +555,7 @@ async def _process_documents_async_pipeline(
     results_queue = asyncio.Queue()
     all_ids = []
     successful_batch_ids = {}
+    failure_event = asyncio.Event()
 
     num_batches = calculate_num_batches(total_chunks, EMBEDDING_BATCH_SIZE)
     consumer_count = max(1, min(parallel_execution, num_batches))
@@ -573,6 +574,9 @@ async def _process_documents_async_pipeline(
         """Produce document batches and put them in the queue."""
         try:
             for batch_idx in range(num_batches):
+                if failure_event.is_set():
+                    break
+
                 start_idx = batch_idx * EMBEDDING_BATCH_SIZE
                 end_idx = min(start_idx + EMBEDDING_BATCH_SIZE, total_chunks)
                 batch_documents = documents[start_idx:end_idx]
@@ -594,12 +598,14 @@ async def _process_documents_async_pipeline(
                     (batch_documents, batch_ids, batch_idx + 1, num_batches)
                 )
         except Exception as e:
+            failure_event.set()
             logger.error("Error in batch producer: %s", e)
             raise
         finally:
-            # Always signal end of production
-            for _ in range(consumer_count):
-                await embedding_queue.put(None)
+            # Signal normal completion; failure paths are cancelled by the caller.
+            if not failure_event.is_set():
+                for _ in range(consumer_count):
+                    await embedding_queue.put(None)
 
     async def embedding_consumer():
         """Consume batches from queue, embed and insert into database."""
@@ -629,6 +635,7 @@ async def _process_documents_async_pipeline(
                     successful_batch_ids[batch_num] = batch_result_ids
                     await results_queue.put((batch_num, batch_result_ids))
                 except Exception as e:
+                    failure_event.set()
                     logger.error(
                         "Error processing batch | user_id=%s | file_id=%s | batch=%d/%d | error=%s | %s",
                         user_id,
@@ -639,12 +646,15 @@ async def _process_documents_async_pipeline(
                         get_process_memory_details(),
                     )
                     await results_queue.put((batch_num, e))  # Put exception object
+                    raise
                 finally:
                     embedding_queue.task_done()
 
         except Exception as e:
-            logger.error("Fatal error in embedding consumer: %s", e)
-            await results_queue.put((None, e))
+            if not failure_event.is_set():
+                failure_event.set()
+                logger.error("Fatal error in embedding consumer: %s", e)
+                await results_queue.put((None, e))
             raise
 
     producer_task = None
