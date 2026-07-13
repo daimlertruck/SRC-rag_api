@@ -9,7 +9,7 @@ import aiofiles.os
 import asyncio
 import time
 from shutil import copyfileobj
-from typing import List, Iterable, Optional, Union, TYPE_CHECKING
+from typing import Dict, List, Iterable, Optional, Union, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import (
     APIRouter,
@@ -556,6 +556,7 @@ async def _process_documents_async_pipeline(
     all_ids = []
     successful_batch_ids = {}
     failure_event = asyncio.Event()
+    in_flight_insert_tasks: Dict[asyncio.Task, int] = {}
 
     num_batches = calculate_num_batches(total_chunks, EMBEDDING_BATCH_SIZE)
     consumer_count = max(1, min(parallel_execution, num_batches))
@@ -607,6 +608,46 @@ async def _process_documents_async_pipeline(
                 for _ in range(consumer_count):
                     await embedding_queue.put(None)
 
+    async def insert_batch(
+        batch_documents: List[Document], batch_ids: List[str], batch_num: int
+    ) -> List[str]:
+        """Track started inserts so rollback waits for executor-backed work."""
+        insert_task = asyncio.create_task(
+            vector_store.aadd_documents(
+                batch_documents, ids=batch_ids, executor=executor
+            )
+        )
+        in_flight_insert_tasks[insert_task] = batch_num
+        try:
+            return await asyncio.shield(insert_task)
+        finally:
+            if insert_task.done():
+                in_flight_insert_tasks.pop(insert_task, None)
+                try:
+                    successful_batch_ids.setdefault(batch_num, insert_task.result())
+                except BaseException:
+                    pass
+
+    async def wait_for_in_flight_inserts() -> None:
+        """Wait for started inserts before rollback can delete inserted vectors."""
+        if not in_flight_insert_tasks:
+            return
+
+        pending_tasks = list(in_flight_insert_tasks)
+        logger.warning(
+            "Waiting for in-flight inserts before rollback | user_id=%s | file_id=%s | inserts=%d | %s",
+            user_id,
+            file_id,
+            len(pending_tasks),
+            get_process_memory_details(),
+        )
+        results = await asyncio.gather(*pending_tasks, return_exceptions=True)
+        for insert_task, result in zip(pending_tasks, results):
+            batch_num = in_flight_insert_tasks.pop(insert_task, None)
+            if batch_num is None or isinstance(result, BaseException):
+                continue
+            successful_batch_ids[batch_num] = result
+
     async def embedding_consumer():
         """Consume batches from queue, embed and insert into database."""
         try:
@@ -629,8 +670,8 @@ async def _process_documents_async_pipeline(
 
                 try:
                     # Insert batch into database
-                    batch_result_ids = await vector_store.aadd_documents(
-                        batch_documents, ids=batch_ids, executor=executor
+                    batch_result_ids = await insert_batch(
+                        batch_documents, batch_ids, batch_num
                     )
                     successful_batch_ids[batch_num] = batch_result_ids
                     await results_queue.put((batch_num, batch_result_ids))
@@ -713,6 +754,8 @@ async def _process_documents_async_pipeline(
             tasks_to_await.extend(consumer_tasks)
             if tasks_to_await:
                 await asyncio.gather(*tasks_to_await, return_exceptions=True)
+
+        await wait_for_in_flight_inserts()
 
         # Attempt rollback only if we inserted something
         if successful_batch_ids:

@@ -414,6 +414,53 @@ class TestProducerConsumerPattern:
                 )
 
     @pytest.mark.asyncio
+    async def test_rollback_waits_for_in_flight_parallel_insert(self):
+        """Rollback must not run while another batch insert can still commit."""
+        import asyncio
+
+        from app.routes.document_routes import _process_documents_async_pipeline
+
+        insert_started = asyncio.Event()
+        events = []
+
+        async def add_documents(docs, ids=None, executor=None):
+            idx = docs[0].metadata["idx"]
+            if idx == 0:
+                events.append("slow_insert_started")
+                insert_started.set()
+                await asyncio.sleep(0.05)
+                events.append("slow_insert_finished")
+                return ["slow_id"]
+
+            await insert_started.wait()
+            events.append("failing_insert")
+            raise ValueError("Test error")
+
+        async def delete(ids=None, executor=None):
+            events.append("rollback")
+
+        mock_store = AsyncMock()
+        mock_store.aadd_documents = add_documents
+        mock_store.delete = delete
+
+        docs = [
+            Document(page_content="slow", metadata={"idx": 0}),
+            Document(page_content="fail", metadata={"idx": 1}),
+        ]
+
+        with patch("app.routes.document_routes.EMBEDDING_BATCH_SIZE", 1):
+            with pytest.raises(ValueError, match="Test error"):
+                await _process_documents_async_pipeline(
+                    documents=docs,
+                    file_id="test",
+                    vector_store=mock_store,
+                    executor=None,
+                    parallel_execution=2,
+                )
+
+        assert events.index("slow_insert_finished") < events.index("rollback")
+
+    @pytest.mark.asyncio
     async def test_all_ids_collected_across_batches(self):
         """Test that IDs from all batches are collected."""
         from app.routes.document_routes import _process_documents_async_pipeline
