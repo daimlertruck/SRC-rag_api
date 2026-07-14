@@ -602,7 +602,6 @@ async def _process_documents_async_pipeline(
     ) -> List[str]:
         """Track started inserts so rollback waits for executor-backed work."""
         nonlocal cleanup_needed
-        cleanup_needed = True
         insert_task = asyncio.create_task(
             vector_store.aadd_documents(
                 batch_documents, ids=batch_ids, executor=executor
@@ -610,13 +609,16 @@ async def _process_documents_async_pipeline(
         )
         in_flight_insert_tasks.add(insert_task)
         try:
-            return await asyncio.shield(insert_task)
+            batch_result_ids = await asyncio.shield(insert_task)
+            cleanup_needed = True
+            return batch_result_ids
         finally:
             if insert_task.done():
                 in_flight_insert_tasks.discard(insert_task)
 
     async def wait_for_in_flight_inserts() -> None:
         """Wait for started inserts before rollback can delete inserted vectors."""
+        nonlocal cleanup_needed
         if not in_flight_insert_tasks:
             return
 
@@ -628,9 +630,11 @@ async def _process_documents_async_pipeline(
             len(pending_tasks),
             get_process_memory_details(),
         )
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
-        for insert_task in pending_tasks:
+        results = await asyncio.gather(*pending_tasks, return_exceptions=True)
+        for insert_task, result in zip(pending_tasks, results):
             in_flight_insert_tasks.discard(insert_task)
+            if not isinstance(result, BaseException):
+                cleanup_needed = True
 
     async def embedding_consumer():
         """Consume batches from queue, embed and insert into database."""
