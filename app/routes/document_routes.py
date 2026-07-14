@@ -614,6 +614,11 @@ async def _process_documents_async_pipeline(
             return batch_result_ids
         finally:
             if insert_task.done():
+                try:
+                    insert_task.result()
+                    cleanup_needed = True
+                except BaseException:
+                    pass
                 in_flight_insert_tasks.discard(insert_task)
 
     async def wait_for_in_flight_inserts() -> None:
