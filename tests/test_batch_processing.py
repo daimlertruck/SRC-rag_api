@@ -121,10 +121,10 @@ class TestBatchProcessing:
         mock_async_vector_store.delete.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_async_pipeline_no_rollback_on_first_batch_error(
+    async def test_async_pipeline_rolls_back_on_first_batch_error(
         self, mock_documents, mock_async_vector_store
     ):
-        """Test that no rollback occurs if first batch fails (nothing inserted)."""
+        """Test failed async ingestion always cleans up by file_id."""
         from app.routes.document_routes import _process_documents_async_pipeline
 
         mock_async_vector_store.aadd_documents = AsyncMock(
@@ -140,8 +140,7 @@ class TestBatchProcessing:
                     executor=None,
                 )
 
-        # Should not attempt rollback since nothing was inserted
-        assert not mock_async_vector_store.delete.called
+        mock_async_vector_store.delete.assert_called_once()
 
     # --- Sync Batched Tests ---
 

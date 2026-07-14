@@ -9,7 +9,7 @@ import aiofiles.os
 import asyncio
 import time
 from shutil import copyfileobj
-from typing import Dict, List, Iterable, Optional, Union, TYPE_CHECKING
+from typing import List, Iterable, Optional, Union, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import (
     APIRouter,
@@ -114,16 +114,6 @@ def get_user_id(request: Request, entity_id: str = None) -> str:
         return entity_id if entity_id else request.state.user.get("id")
 
 
-def get_file_size_bytes(file_path: Optional[str]) -> Optional[int]:
-    """Return file size in bytes when available."""
-    if not file_path:
-        return None
-    try:
-        return os.path.getsize(file_path)
-    except OSError:
-        return None
-
-
 def get_process_memory_details() -> str:
     """Return lightweight process memory details for logging."""
     parts = []
@@ -179,9 +169,11 @@ def build_ingestion_context(
     if content_type:
         parts.append(f"content_type={content_type}")
     if temp_file_path:
-        file_size_bytes = get_file_size_bytes(temp_file_path)
-        if file_size_bytes is not None:
+        try:
+            file_size_bytes = os.path.getsize(temp_file_path)
             parts.append(f"file_size_bytes={file_size_bytes}")
+        except OSError:
+            pass
     if known_type:
         parts.append(f"known_type={known_type}")
     if file_ext:
@@ -548,15 +540,11 @@ async def _process_documents_async_pipeline(
 
     # Create queues for producer-consumer pattern
     # embedding_queue is bounded to limit document data held in memory.
-    # results_queue is unbounded — it holds only small UUID lists, and the
-    # drain loop runs after gather(), so bounding it would deadlock when
-    # num_batches > maxsize.
     embedding_queue = asyncio.Queue(maxsize=EMBEDDING_MAX_QUEUE_SIZE)
-    results_queue = asyncio.Queue()
     all_ids = []
     successful_batch_ids = {}
     failure_event = asyncio.Event()
-    in_flight_insert_tasks: Dict[asyncio.Task, int] = {}
+    in_flight_insert_tasks = set()
 
     num_batches = calculate_num_batches(total_chunks, EMBEDDING_BATCH_SIZE)
     consumer_count = max(1, min(parallel_execution, num_batches))
@@ -609,7 +597,7 @@ async def _process_documents_async_pipeline(
                     await embedding_queue.put(None)
 
     async def insert_batch(
-        batch_documents: List[Document], batch_ids: List[str], batch_num: int
+        batch_documents: List[Document], batch_ids: List[str]
     ) -> List[str]:
         """Track started inserts so rollback waits for executor-backed work."""
         insert_task = asyncio.create_task(
@@ -617,16 +605,12 @@ async def _process_documents_async_pipeline(
                 batch_documents, ids=batch_ids, executor=executor
             )
         )
-        in_flight_insert_tasks[insert_task] = batch_num
+        in_flight_insert_tasks.add(insert_task)
         try:
             return await asyncio.shield(insert_task)
         finally:
             if insert_task.done():
-                in_flight_insert_tasks.pop(insert_task, None)
-                try:
-                    successful_batch_ids.setdefault(batch_num, insert_task.result())
-                except BaseException:
-                    pass
+                in_flight_insert_tasks.discard(insert_task)
 
     async def wait_for_in_flight_inserts() -> None:
         """Wait for started inserts before rollback can delete inserted vectors."""
@@ -641,12 +625,9 @@ async def _process_documents_async_pipeline(
             len(pending_tasks),
             get_process_memory_details(),
         )
-        results = await asyncio.gather(*pending_tasks, return_exceptions=True)
-        for insert_task, result in zip(pending_tasks, results):
-            batch_num = in_flight_insert_tasks.pop(insert_task, None)
-            if batch_num is None or isinstance(result, BaseException):
-                continue
-            successful_batch_ids[batch_num] = result
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        for insert_task in pending_tasks:
+            in_flight_insert_tasks.discard(insert_task)
 
     async def embedding_consumer():
         """Consume batches from queue, embed and insert into database."""
@@ -670,11 +651,8 @@ async def _process_documents_async_pipeline(
 
                 try:
                     # Insert batch into database
-                    batch_result_ids = await insert_batch(
-                        batch_documents, batch_ids, batch_num
-                    )
+                    batch_result_ids = await insert_batch(batch_documents, batch_ids)
                     successful_batch_ids[batch_num] = batch_result_ids
-                    await results_queue.put((batch_num, batch_result_ids))
                 except Exception as e:
                     failure_event.set()
                     logger.error(
@@ -686,7 +664,6 @@ async def _process_documents_async_pipeline(
                         e,
                         get_process_memory_details(),
                     )
-                    await results_queue.put((batch_num, e))  # Put exception object
                     raise
                 finally:
                     embedding_queue.task_done()
@@ -695,7 +672,6 @@ async def _process_documents_async_pipeline(
             if not failure_event.is_set():
                 failure_event.set()
                 logger.error("Fatal error in embedding consumer: %s", e)
-                await results_queue.put((None, e))
             raise
 
     producer_task = None
@@ -710,12 +686,6 @@ async def _process_documents_async_pipeline(
 
         # Wait for all tasks to complete
         await asyncio.gather(producer_task, *consumer_tasks, return_exceptions=False)
-
-        # Collect results from all batches
-        for _ in range(num_batches):
-            batch_num, result = await results_queue.get()
-            if isinstance(result, Exception):
-                raise result
 
         for batch_num in range(1, num_batches + 1):
             all_ids.extend(successful_batch_ids[batch_num])
@@ -757,30 +727,28 @@ async def _process_documents_async_pipeline(
 
         await wait_for_in_flight_inserts()
 
-        # Attempt rollback only if we inserted something
-        if successful_batch_ids:
-            try:
-                logger.warning(
-                    "Performing rollback | user_id=%s | file_id=%s | %s",
-                    user_id,
-                    file_id,
-                    get_process_memory_details(),
-                )
-                await vector_store.delete(ids=[file_id], executor=executor)
-                logger.info(
-                    "Rollback completed | user_id=%s | file_id=%s | %s",
-                    user_id,
-                    file_id,
-                    get_process_memory_details(),
-                )
-            except Exception as cleanup_error:
-                logger.error(
-                    "Rollback failed | user_id=%s | file_id=%s | error=%s | %s",
-                    user_id,
-                    file_id,
-                    cleanup_error,
-                    get_process_memory_details(),
-                )
+        try:
+            logger.warning(
+                "Performing rollback | user_id=%s | file_id=%s | %s",
+                user_id,
+                file_id,
+                get_process_memory_details(),
+            )
+            await vector_store.delete(ids=[file_id], executor=executor)
+            logger.info(
+                "Rollback completed | user_id=%s | file_id=%s | %s",
+                user_id,
+                file_id,
+                get_process_memory_details(),
+            )
+        except Exception as cleanup_error:
+            logger.error(
+                "Rollback failed | user_id=%s | file_id=%s | error=%s | %s",
+                user_id,
+                file_id,
+                cleanup_error,
+                get_process_memory_details(),
+            )
 
         # Re-raise the original error
         raise
