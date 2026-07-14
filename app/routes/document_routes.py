@@ -545,6 +545,7 @@ async def _process_documents_async_pipeline(
     successful_batch_ids = {}
     failure_event = asyncio.Event()
     in_flight_insert_tasks = set()
+    cleanup_needed = False
 
     num_batches = calculate_num_batches(total_chunks, EMBEDDING_BATCH_SIZE)
     consumer_count = max(1, min(parallel_execution, num_batches))
@@ -600,6 +601,8 @@ async def _process_documents_async_pipeline(
         batch_documents: List[Document], batch_ids: List[str]
     ) -> List[str]:
         """Track started inserts so rollback waits for executor-backed work."""
+        nonlocal cleanup_needed
+        cleanup_needed = True
         insert_task = asyncio.create_task(
             vector_store.aadd_documents(
                 batch_documents, ids=batch_ids, executor=executor
@@ -727,28 +730,29 @@ async def _process_documents_async_pipeline(
 
         await wait_for_in_flight_inserts()
 
-        try:
-            logger.warning(
-                "Performing rollback | user_id=%s | file_id=%s | %s",
-                user_id,
-                file_id,
-                get_process_memory_details(),
-            )
-            await vector_store.delete(ids=[file_id], executor=executor)
-            logger.info(
-                "Rollback completed | user_id=%s | file_id=%s | %s",
-                user_id,
-                file_id,
-                get_process_memory_details(),
-            )
-        except Exception as cleanup_error:
-            logger.error(
-                "Rollback failed | user_id=%s | file_id=%s | error=%s | %s",
-                user_id,
-                file_id,
-                cleanup_error,
-                get_process_memory_details(),
-            )
+        if cleanup_needed:
+            try:
+                logger.warning(
+                    "Performing rollback | user_id=%s | file_id=%s | %s",
+                    user_id,
+                    file_id,
+                    get_process_memory_details(),
+                )
+                await vector_store.delete(ids=[file_id], executor=executor)
+                logger.info(
+                    "Rollback completed | user_id=%s | file_id=%s | %s",
+                    user_id,
+                    file_id,
+                    get_process_memory_details(),
+                )
+            except Exception as cleanup_error:
+                logger.error(
+                    "Rollback failed | user_id=%s | file_id=%s | error=%s | %s",
+                    user_id,
+                    file_id,
+                    cleanup_error,
+                    get_process_memory_details(),
+                )
 
         # Re-raise the original error
         raise
